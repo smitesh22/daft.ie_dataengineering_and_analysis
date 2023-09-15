@@ -1,13 +1,16 @@
 import os
 import re
 import pandas as pd
+import io
 from datetime import datetime
 
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.amazon.aws.operators.s3 import S3CreateObjectOperator
 from airflow.providers.snowflake.operators.snowflake import  SnowflakeOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from airflow.operators.bash import BashOperator
 from airflow.models import DAG
+from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 
@@ -100,7 +103,7 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
                 '''
             )
 
-        check_file_on_amazon >> snowflake_create_table >> create_snowflake_data_stage >> copy_s3_object_in_snowflake_table
+        [check_file_on_amazon ,snowflake_create_table , create_snowflake_data_stage] >> copy_s3_object_in_snowflake_table
 
     with TaskGroup("Transform") as transform:
 
@@ -116,23 +119,101 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             df['PROPERTYTYPE'] = df.PROPERTYTYPE.apply(lambda x : x.split('.')[-1])
             df.rename(columns={"TITLE": "ADDRESS"}, inplace = True)
             df = df[['ID', 'ADDRESS', 'COUNTY', 'SALETYPE', 'PROPERTYTYPE', 'BATHROOMS', 'BEDROOMS', 'BER', 'CATEGORY', 'MONTHLY_PRICE', 'PRICE', 'LATITUDE', 'LONGITUDE', 'PUBLISH_DATE', 'AGENT_ID', "AGENT_BRANCH", "AGENT_NAME", "AGENT_SELLER_TYPE"]]
+            object_columns = df.select_dtypes(include=['object']).columns
+
             
-            
+            for col in object_columns:
+                df[col] = df[col].str.replace("'", "''")
+                df[col] = df[col].str.strip()  
+                df[col] = df[col].str.replace('"', "'")
+
+            df = df.convert_dtypes()
+
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            csv_data = csv_buffer.getvalue()
+
+            def check_if_object_exists(bucket_name, key):
+                s3_hook = S3Hook(aws_conn_id = "aws_default")
+
+                try:
+                    s3_hook.get_key(key, bucket_name)
+                    return True
+                except:
+                    return False
+                
+            s3_bucket = 'daftsnowflake'
+            s3_key = 'preprocessed_data.csv'
+    
+            if not check_if_object_exists(s3_bucket, s3_key):
+                S3CreateObjectOperator(
+                    task_id="Upload-to-S3",
+                    aws_conn_id= 'aws_default',
+                    s3_bucket='daftsnowflake',
+                    s3_key='preprocessed_data.csv',
+                    data=csv_data.encode(),    
+                ).execute({})
             return df
         
+
         @task
-        def create_tables_and_schema_for_transformed_tables(df):
-            return SnowflakeOperator(
+        def create_tables_and_schema_for_transformed_tables():
+            current_dir = os.path.dirname(__file__)
+
+            sql_file_path = os.path.join(current_dir, '..', 'include', 'sql', 'transformed_schema.sql')
+
+            with open(sql_file_path, 'r') as sql_file:
+                sql = sql_file.read()
+            
+            
+            SnowflakeOperator(
                 task_id = 'create_tables_for_transformed_data',
                 snowflake_conn_id = 'snowflake_transformed',
-                sql = '''
-                    
-                      '''
-            )
-            
+                sql = sql,
+            ).execute({})
 
+            sql_file_path = os.path.join(current_dir, '..', 'include', 'sql', 'create_daft_table_for_transformed_schema_and_copy.sql')
+
+            with open(sql_file_path, 'r') as sql_file:
+                sql = sql_file.read()
+
+
+        
+        load_dimension_table_agent = SnowflakeOperator(
+            task_id = "load_dimension_table_agent",
+            snowflake_conn_id= "snowflake_transformed",
+            sql = """
+                    INSERT INTO AGENT(AGENT_ID, AGENT_BRANCH, AGENT_NAME, AGENT_SELLER_TYPE)
+                    SELECT d.AGENT_ID, d.AGENT_BRANCH, d.AGENT_NAME, d.AGENT_SELLER_TYPE FROM DAFT_TRANSFORMED AS d;        
+            """
+        )
+
+        load_dimension_table_property = SnowflakeOperator(
+            task_id = "load_dimension_table_property",
+            snowflake_conn_id= "snowflake_transformed",
+            sql = """
+                    INSERT INTO PROPERTY(PROPERTYTYPE, BATHROOMS, BEDROOMS, BER, CATEGORY)
+                    VALUES D.PROPERTYTYPE, D.BATHROOMS, D.BEDROOMS, D.BER, D.CATEGORY FROM DAFT_TRANSFORMED AS D;
+            """
+        )   
+        
+
+
+        @task
+        def create_dimension_property(df):
+            pass
+
+        @task
+        def create_fact_sales():
+            pass
+        
         df = preprocess_extract_table() 
-        create_tables_and_schema_for_transformed_tables(df)
+        create_tables_task = create_tables_and_schema_for_transformed_tables()    
+        
+        create_dimension_property_task = create_dimension_property(df)
+        create_fact_sales = create_fact_sales()
+
+        df >> [load_dimension_table_agent, load_dimension_table_property, create_dimension_property_task] >> create_fact_sales
 
     extract >> transform
 
