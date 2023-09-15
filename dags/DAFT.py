@@ -1,4 +1,6 @@
 import os
+import re
+import pandas as pd
 from datetime import datetime
 
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
@@ -9,7 +11,6 @@ from airflow.models import DAG
 from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
 
-from pandas import DataFrame
 
 from astro import sql as aql
 
@@ -104,23 +105,34 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
     with TaskGroup("Transform") as transform:
 
         @task
-        def transform_letting_table():
+        def preprocess_extract_table():
             snowflake_hook = SnowflakeHook(
                 snowflake_conn_id = 'snowflake_default'
             )
 
             df = snowflake_hook.get_pandas_df('SELECT * FROM DAFT')
-            print("df")
-            print(df.head())
-
+            df['COUNTY'] = df.LOCATION.apply(lambda x : re.split('[._]', x)[-1])
+            df['SALETYPE'] = df.SEARCHTYPE.apply(lambda x : x.split('.')[-1])
+            df['PROPERTYTYPE'] = df.PROPERTYTYPE.apply(lambda x : x.split('.')[-1])
+            df.rename(columns={"TITLE": "ADDRESS"}, inplace = True)
+            df = df[['ID', 'ADDRESS', 'COUNTY', 'SALETYPE', 'PROPERTYTYPE', 'BATHROOMS', 'BEDROOMS', 'BER', 'CATEGORY', 'MONTHLY_PRICE', 'PRICE', 'LATITUDE', 'LONGITUDE', 'PUBLISH_DATE', 'AGENT_ID', "AGENT_BRANCH", "AGENT_NAME", "AGENT_SELLER_TYPE"]]
+            
+            
             return df
         
         @task
-        def load_table(df):
-            print(df.head())
+        def create_tables_and_schema_for_transformed_tables(df):
+            return SnowflakeOperator(
+                task_id = 'create_tables_for_transformed_data',
+                snowflake_conn_id = 'snowflake_transformed',
+                sql = '''
+                    
+                      '''
+            )
+            
 
-        df = transform_letting_table() 
-        load_table(df)
+        df = preprocess_extract_table() 
+        create_tables_and_schema_for_transformed_tables(df)
 
     extract >> transform
 
