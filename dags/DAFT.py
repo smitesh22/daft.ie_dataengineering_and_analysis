@@ -194,14 +194,6 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             sql = """
                     INSERT INTO PROPERTY(PROPERTYTYPE, BATHROOMS, BEDROOMS, BER, CATEGORY)
                     SELECT D.PROPERTYTYPE, D.BATHROOMS, D.BEDROOMS, D.BER, D.CATEGORY FROM DAFT_TRANSFORMED AS D;
-
-                     -- Get the last generated property_id
-                    SET $last_property_id = LAST_INSERT_ID();
-
-                    -- Update the daft_transformed table with the last property_id
-                    UPDATE DAFT_TRANSFORMED
-                    SET property_id = $last_property_id
-                    WHERE property_id IS NULL; -- Only update rows where property_id is not already set
             """
         )
 
