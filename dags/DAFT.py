@@ -193,29 +193,55 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             snowflake_conn_id= "snowflake_transformed",
             sql = """
                     INSERT INTO PROPERTY(PROPERTYTYPE, BATHROOMS, BEDROOMS, BER, CATEGORY)
-                    VALUES D.PROPERTYTYPE, D.BATHROOMS, D.BEDROOMS, D.BER, D.CATEGORY FROM DAFT_TRANSFORMED AS D;
+                    SELECT D.PROPERTYTYPE, D.BATHROOMS, D.BEDROOMS, D.BER, D.CATEGORY FROM DAFT_TRANSFORMED AS D;
+
+                     -- Get the last generated property_id
+                    SET $last_property_id = LAST_INSERT_ID();
+
+                    -- Update the daft_transformed table with the last property_id
+                    UPDATE DAFT_TRANSFORMED
+                    SET property_id = $last_property_id
+                    WHERE property_id IS NULL; -- Only update rows where property_id is not already set
             """
-        )   
+        )
+
+        load_dimension_table_location = SnowflakeOperator(
+            task_id = "load_dimension_table_location",
+            snowflake_conn_id="snowflake_transformed",
+            sql = """
+                    INSERT INTO LOCATION(ADDRESS, COUNTY, LATITUDE, LONGITUDE)
+                    SELECT D.ADDRESS, D.COUNTY, D.LATITUDE, D.LONGITUDE FROM DAFT_TRANSFORMED AS D;
+                """
+        )
         
-
-
-        @task
-        def create_dimension_property(df):
-            pass
-
+        
         @task
         def create_fact_sales():
             pass
-        
+
         df = preprocess_extract_table() 
         create_tables_task = create_tables_and_schema_for_transformed_tables()    
         
-        create_dimension_property_task = create_dimension_property(df)
         create_fact_sales = create_fact_sales()
 
-        df >> [load_dimension_table_agent, load_dimension_table_property, create_dimension_property_task] >> create_fact_sales
+        (df >> create_tables_task) >> [load_dimension_table_agent, load_dimension_table_location, load_dimension_table_property] >> create_fact_sales
 
-    extract >> transform
+        
+    with TaskGroup("Load") as load:
+
+        @task
+        def verify():
+            pass
+
+        @task
+        def email():
+            pass
+        
+        
+        verify() >> email()
+
+
+    extract >> transform >> load
 
     
 
