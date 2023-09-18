@@ -4,7 +4,7 @@ import pandas as pd
 import io
 from datetime import datetime
 
-from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor, S3Hook
 from airflow.providers.amazon.aws.operators.s3 import S3CreateObjectOperator
 from airflow.providers.snowflake.operators.snowflake import  SnowflakeOperator
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
@@ -117,15 +117,24 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             df['COUNTY'] = df.LOCATION.apply(lambda x : re.split('[._]', x)[-1])
             df['SALETYPE'] = df.SEARCHTYPE.apply(lambda x : x.split('.')[-1])
             df['PROPERTYTYPE'] = df.PROPERTYTYPE.apply(lambda x : x.split('.')[-1])
+            extract_numeric_value = lambda s: float(max([int(match.replace(',', '')) for match in re.findall(r'[0-9,]+', s)])) if re.findall(r'[0-9,]+', s) else 0.0
+            df['PRICE'] = df['PRICE'].apply(extract_numeric_value)
             df.rename(columns={"TITLE": "ADDRESS"}, inplace = True)
             df = df[['ID', 'ADDRESS', 'COUNTY', 'SALETYPE', 'PROPERTYTYPE', 'BATHROOMS', 'BEDROOMS', 'BER', 'CATEGORY', 'MONTHLY_PRICE', 'PRICE', 'LATITUDE', 'LONGITUDE', 'PUBLISH_DATE', 'AGENT_ID', "AGENT_BRANCH", "AGENT_NAME", "AGENT_SELLER_TYPE"]]
             object_columns = df.select_dtypes(include=['object']).columns
+            
 
             
+
+            print(df.PRICE)
+            
+            """
             for col in object_columns:
                 df[col] = df[col].str.replace("'", "''")
                 df[col] = df[col].str.strip()  
                 df[col] = df[col].str.replace('"', "'")
+
+            """
 
             df = df.convert_dtypes()
 
@@ -133,26 +142,13 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             df.to_csv(csv_buffer, index=False)
             csv_data = csv_buffer.getvalue()
 
-            def check_if_object_exists(bucket_name, key):
-                s3_hook = S3Hook(aws_conn_id = "aws_default")
-
-                try:
-                    s3_hook.get_key(key, bucket_name)
-                    return True
-                except:
-                    return False
-                
+            
+            aws_conn_id = 'aws_default'
             s3_bucket = 'daftsnowflake'
             s3_key = 'preprocessed_data.csv'
-    
-            if not check_if_object_exists(s3_bucket, s3_key):
-                S3CreateObjectOperator(
-                    task_id="Upload-to-S3",
-                    aws_conn_id= 'aws_default',
-                    s3_bucket='daftsnowflake',
-                    s3_key='preprocessed_data.csv',
-                    data=csv_data.encode(),    
-                ).execute({})
+
+            s3_hook = S3Hook(aws_conn_id)
+            s3_hook.load_string(csv_data, s3_key, bucket_name=s3_bucket, replace=True)
             return df
         
 
@@ -179,8 +175,8 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
 
 
         
-        load_dimension_table_agent = SnowflakeOperator(
-            task_id = "load_dimension_table_agent",
+        load_table_agent = SnowflakeOperator(
+            task_id = "load__table_agent",
             snowflake_conn_id= "snowflake_transformed",
             sql = """
                     INSERT INTO AGENT(AGENT_ID, AGENT_BRANCH, AGENT_NAME, AGENT_SELLER_TYPE)
@@ -188,8 +184,8 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             """
         )
 
-        load_dimension_table_property = SnowflakeOperator(
-            task_id = "load_dimension_table_property",
+        load_table_property = SnowflakeOperator(
+            task_id = "load_table_property",
             snowflake_conn_id= "snowflake_transformed",
             sql = """
                     INSERT INTO PROPERTY(PROPERTYTYPE, BATHROOMS, BEDROOMS, BER, CATEGORY)
@@ -197,8 +193,8 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             """
         )
 
-        load_dimension_table_location = SnowflakeOperator(
-            task_id = "load_dimension_table_location",
+        load_table_location = SnowflakeOperator(
+            task_id = "load_table_location",
             snowflake_conn_id="snowflake_transformed",
             sql = """
                     INSERT INTO LOCATION(ADDRESS, COUNTY, LATITUDE, LONGITUDE)
@@ -206,17 +202,20 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
                 """
         )
         
-        
-        @task
-        def create_fact_sales():
-            pass
+        load_table_sales = SnowflakeOperator(
+            task_id = 'load_table_sales',
+            snowflake_conn_id = "snowflake_transformed",
+            sql = """
+                        INSERT INTO SALES(SALE_ID, SALETYPE, MONTHLY_PRICE, PRICE, PUBLISH_DATE)
+                        SELECT D.ID, D.SALETYPE, D.MONTHLY_PRICE, D.PRICE, D.PUBLISH_DATE FROM DAFT_TRANSFORMED AS D;
+                  """
+        )
 
         df = preprocess_extract_table() 
         create_tables_task = create_tables_and_schema_for_transformed_tables()    
-        
-        create_fact_sales = create_fact_sales()
 
-        (df >> create_tables_task) >> [load_dimension_table_agent, load_dimension_table_location, load_dimension_table_property] >> create_fact_sales
+
+        (df >> create_tables_task) >> [load_table_agent, load_table_location, load_table_property] >> load_table_sales
 
         
     with TaskGroup("Load") as load:
