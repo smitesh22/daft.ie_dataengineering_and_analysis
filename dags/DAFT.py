@@ -13,6 +13,7 @@ from airflow.models import DAG
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.decorators import task
 from airflow.utils.task_group import TaskGroup
+from airflow.operators.email import EmailOperator
 
 
 from astro import sql as aql
@@ -105,7 +106,7 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
 
         [check_file_on_amazon ,snowflake_create_table , create_snowflake_data_stage] >> copy_s3_object_in_snowflake_table
 
-    with TaskGroup("Transform") as transform:
+    with TaskGroup("Load") as load:
 
         @task
         def preprocess_extract_table():
@@ -149,7 +150,51 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
 
             s3_hook = S3Hook(aws_conn_id)
             s3_hook.load_string(csv_data, s3_key, bucket_name=s3_bucket, replace=True)
-            return df
+
+
+        create_daft_trasform = SnowflakeOperator(
+                task_id = "create_daft_trasform",
+                snowflake_conn_id = "snowflake_transformed",
+                sql = """
+                    
+                    CREATE OR REPLACE TABLE DAFT_TRANSFORMED(
+                        ID INT,
+                        ADDRESS STRING,
+                        COUNTY STRING,
+                        SALETYPE STRING,
+                        PROPERTYTYPE STRING,
+                        BER STRING,
+                        BATHROOMS STRING,
+                        BEDROOMS STRING,
+                        CATEGORY STRING,
+                        MONTHLY_PRICE STRING,
+                        PRICE STRING,
+                        LATITUDE FLOAT,
+                        LONGITUDE FLOAT,
+                        PUBLISH_DATE STRING,
+                        AGENT_ID INT,
+                        AGENT_BRANCH STRING,
+                        AGENT_NAME STRING,
+                        AGENT_SELLER_TYPE STRING,
+                        PRIMARY KEY(ID));
+
+                    COPY INTO DAFT_TRANSFORMED
+                        FROM @AWS_DAFT
+                        FILES = ('preprocessed_data.csv')
+                        FILE_FORMAT = (
+                                        TYPE=CSV,
+                                        SKIP_HEADER=1,
+                                        FIELD_DELIMITER=',',
+                                        TRIM_SPACE=FALSE,
+                                        FIELD_OPTIONALLY_ENCLOSED_BY='"',
+                                        DATE_FORMAT=AUTO,
+                                        TIME_FORMAT=AUTO,
+                                        TIMESTAMP_FORMAT=AUTO
+                                    )
+                    ON_ERROR=ABORT_STATEMENT;
+                    """
+        )
+
         
 
         @task
@@ -206,33 +251,86 @@ with DAG(dag_id="daft_pipeline", start_date=datetime(2023, 9, 14), schedule='@da
             task_id = 'load_table_sales',
             snowflake_conn_id = "snowflake_transformed",
             sql = """
-                        INSERT INTO SALES(SALE_ID, SALETYPE, MONTHLY_PRICE, PRICE, PUBLISH_DATE)
-                        SELECT D.ID, D.SALETYPE, D.MONTHLY_PRICE, D.PRICE, D.PUBLISH_DATE FROM DAFT_TRANSFORMED AS D;
+                        INSERT INTO SALES(SALE_ID, SALETYPE, MONTHLY_PRICE, PRICE, PUBLISH_DATE, AGENT_ID)
+                        SELECT D.ID, D.SALETYPE, D.MONTHLY_PRICE, D.PRICE, D.PUBLISH_DATE, D.AGENT_ID FROM DAFT_TRANSFORMED AS D;
                   """
         )
+
+
+        
+        
+
+
 
         df = preprocess_extract_table() 
         create_tables_task = create_tables_and_schema_for_transformed_tables()    
 
 
-        (df >> create_tables_task) >> [load_table_agent, load_table_location, load_table_property] >> load_table_sales
+        (df >> create_daft_trasform >> create_tables_task ) >> [load_table_agent, load_table_location, load_table_property] >> load_table_sales 
 
         
-    with TaskGroup("Load") as load:
+    with TaskGroup("Transform") as transform:
+
+        transform_dimension_table_agent = SnowflakeOperator(
+            task_id = "transform_dimension_table_agent",
+            snowflake_conn_id = "snowflake_transformed",
+            sql = """
+                INSERT INTO DIMENSION_AGENT(AGENT_ID, AGENT_NAME, AGENT_BRANCH, AGENT_SELLER_TYPE) 
+                SELECT A.AGENT_ID, A.AGENT_NAME, A.AGENT_BRANCH, A.AGENT_SELLER_TYPE FROM AGENT AS A; 
+
+                SELECT AGENT_ID, AGENT_BRANCH, AGENT_SELLER_TYPE FROM DIMENSION_AGENT;
+
+                CREATE OR REPLACE TABLE DIMENSION_AGENT AS
+                SELECT DISTINCT AGENT_ID, AGENT_BRANCH, AGENT_SELLER_TYPE 
+                FROM DIMENSION_AGENT;
+                """
+
+        )
+
+        transform_dimension_table_propery = SnowflakeOperator(
+            task_id = "transform_dimension_table_propery",
+            snowflake_conn_id= "snowflake_transformed",
+            sql = """
+                INSERT INTO DIMENSION_PROPERTY(PROPERTY_ID, PROPERTYTYPE, BATHROOMS, BEDROOMS, BER, CATEGORY)
+                SELECT P.PROPERTY_ID, P.PROPERTYTYPE, P.BATHROOMS, P.BEDROOMS, P.BER, P.CATEGORY FROM PROPERTY AS P;
+                """
+
+        )
+
+        transform_dimension_table_location = SnowflakeOperator(
+            task_id = "transform_dimension_table_location",
+            snowflake_conn_id= "snowflake_transformed",
+            sql = """
+                INSERT INTO DIMENSION_LOCATION(LOCATION_ID, ADDRESS, COUNTY, LATITUDE, LONGITUDE) 
+                SELECT L.LOCATION_ID, L.ADDRESS, L.COUNTY, L.LATITUDE, L.LONGITUDE FROM LOCATION L;
+                """
+
+        )
+
+        transform_fact_table_sales = SnowflakeOperator(
+            task_id = "transform_fact_table_sales",
+            snowflake_conn_id = "snowflake_transformed",
+            sql = """
+            CREATE OR REPLACE TABLE FACT_SALES AS 
+            SELECT S.SALE_ID, S.SALETYPE, S.MONTHLY_PRICE, S.PRICE, S.PUBLISH_DATE, A.AGENT_ID, P.PROPERTY_ID, L.LOCATION_ID
+            FROM SALES AS S
+            INNER JOIN DIMENSION_AGENT AS A ON S.AGENT_ID = A.AGENT_ID
+            INNER JOIN DIMENSION_PROPERTY AS P ON S.PROPERTY_ID = P.PROPERTY_ID
+            INNER JOIN DIMENSION_LOCATION AS L ON S.LOCATION_ID = L.LOCATION_ID;
+                """
+        )
 
         @task
         def verify():
             pass
+        
 
-        @task
-        def email():
-            pass
         
         
-        verify() >> email()
+        [transform_dimension_table_agent, transform_dimension_table_propery, transform_dimension_table_location] >> transform_fact_table_sales >> verify()
 
 
-    extract >> transform >> load
+    extract >> load >> transform
 
     
 
