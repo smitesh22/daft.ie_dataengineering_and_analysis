@@ -12,5 +12,7 @@ Pipeline Diagram
 
 ![Data Pipeline](image.png)
 
+![Airflow][image-1.png]
+
 
 This project was developed using Astro sdk to start install astro sdk and run command astro dev start for airflow to be available on localhost
